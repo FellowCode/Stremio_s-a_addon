@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Smotret Anime logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#103a2b"/>
+      <stop offset="100%" stop-color="#2a8f62"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <path d="M32 38h64v12H32z" fill="#f4f1de" opacity="0.92"/>
+  <path d="M32 58h64v12H32z" fill="#f4f1de" opacity="0.92"/>
+  <path d="M32 78h40v12H32z" fill="#f4f1de" opacity="0.92"/>
+  <circle cx="90" cy="84" r="18" fill="#f7b267"/>
+  <path d="M84 75l14 9-14 9z" fill="#103a2b"/>
+</svg>

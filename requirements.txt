@@ -1,0 +1,10 @@
+fastapi
+sqlalchemy[asyncio]==2.1.0b1
+aiosqlite
+httpx
+python-dotenv
+alembic
+uvicorn
+beautifulsoup4
+rich
+kitsu.py-extended
