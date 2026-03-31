@@ -20,6 +20,10 @@ query ($search: String!) {
     Page(page: 1, perPage: 8) {
         media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
             format
+            seasonYear
+            startDate {
+                year
+            }
             title {
                 romaji
                 english
@@ -35,7 +39,7 @@ ANILIST_CACHE_TTL = timedelta(hours=ANILIST_CACHE_TTL_HOURS)
 CINEMETA_CACHE_TTL = timedelta(hours=CINEMETA_CACHE_TTL_HOURS)
 KITSU_MAPPINGS_CACHE_TTL = timedelta(hours=KITSU_MAPPINGS_CACHE_TTL_HOURS)
 SEARCH_TARGETS_CACHE_TTL = timedelta(hours=12)
-_SEARCH_TARGETS_CACHE: dict[tuple[str, str, str], tuple[datetime, SearchTargets]] = {}
+_SEARCH_TARGETS_CACHE: dict[tuple[str, str, str, int | None, int], tuple[datetime, SearchTargets]] = {}
 
 
 @dataclass(slots=True)
@@ -91,7 +95,13 @@ def parse_stream_request_id(content_type: str, raw_id: str) -> StreamRequest:
 
 
 async def get_stream_search_targets(content_type: str, stream_request: StreamRequest) -> SearchTargets:
-    cache_key = (content_type, stream_request.provider, stream_request.catalog_id)
+    cache_key = (
+        content_type,
+        stream_request.provider,
+        stream_request.catalog_id,
+        stream_request.season_number,
+        stream_request.episode_number,
+    )
     cached_targets = _get_cached_search_targets(cache_key)
     if cached_targets is not None:
         return cached_targets
@@ -111,7 +121,12 @@ async def get_stream_search_targets(content_type: str, stream_request: StreamReq
 
     if stream_request.provider == 'tt':
         targets = SearchTargets(
-            titles=await get_cinemeta_search_titles(content_type, stream_request.catalog_id),
+            titles=await get_cinemeta_search_titles(
+                content_type,
+                stream_request.catalog_id,
+                season_number=stream_request.season_number,
+                episode_number=stream_request.episode_number,
+            ),
             external_urls=[],
         )
         _save_cached_search_targets(cache_key, targets)
@@ -282,7 +297,7 @@ def _append_external_search_url(urls: list[str], seen: set[str], value: str | No
     urls.append(normalized)
 
 
-def _get_cached_search_targets(cache_key: tuple[str, str, str]) -> SearchTargets | None:
+def _get_cached_search_targets(cache_key: tuple[str, str, str, int | None, int]) -> SearchTargets | None:
     cached_entry = _SEARCH_TARGETS_CACHE.get(cache_key)
     if cached_entry is None:
         return None
@@ -296,7 +311,7 @@ def _get_cached_search_targets(cache_key: tuple[str, str, str]) -> SearchTargets
     )
 
 
-def _save_cached_search_targets(cache_key: tuple[str, str, str], search_targets: SearchTargets) -> None:
+def _save_cached_search_targets(cache_key: tuple[str, str, str, int | None, int], search_targets: SearchTargets) -> None:
     _SEARCH_TARGETS_CACHE[cache_key] = (
         _utcnow(),
         SearchTargets(
@@ -306,28 +321,43 @@ def _save_cached_search_targets(cache_key: tuple[str, str, str], search_targets:
     )
 
 
-async def get_cinemeta_search_titles(content_type: str, stremio_id: str) -> list[str]:
+async def get_cinemeta_search_titles(
+    content_type: str,
+    stremio_id: str,
+    season_number: int | None = None,
+    episode_number: int = 1,
+) -> list[str]:
     cached_titles = await _get_cached_cinemeta_titles(content_type, stremio_id)
     if cached_titles is not None:
-        titles = list(cached_titles)
-        seen = {value.casefold() for value in titles}
+        target_year = await _get_cinemeta_target_year(content_type, stremio_id, season_number, episode_number)
+        enriched_titles = await _get_anilist_search_titles(content_type, list(cached_titles), target_year=target_year)
+        return _merge_search_titles(list(cached_titles), enriched_titles, season_number)
 
-        def add(value: str | None) -> None:
-            _append_title_variants(titles, seen, value)
+    meta = await _fetch_cinemeta_meta(content_type, stremio_id)
+    if meta is None:
+        return []
 
-        enriched_titles = await _get_anilist_search_titles(content_type, titles)
-        for value in enriched_titles:
-            add(value)
-        return titles
+    titles = _extract_cinemeta_titles(meta)
+    await _save_cached_cinemeta_titles(content_type, stremio_id, titles)
 
+    target_year = _extract_cinemeta_target_year(meta, season_number, episode_number)
+    enriched_titles = await _get_anilist_search_titles(content_type, titles, target_year=target_year)
+    return _merge_search_titles(titles, enriched_titles, season_number)
+
+
+async def _fetch_cinemeta_meta(content_type: str, stremio_id: str) -> dict | None:
     url = f'https://v3-cinemeta.strem.io/meta/{content_type}/{stremio_id}.json'
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         response = await client.get(url)
 
     if response.status_code != 200:
-        return []
+        return None
 
     meta = response.json().get('meta') or {}
+    return meta if isinstance(meta, dict) else None
+
+
+def _extract_cinemeta_titles(meta: dict) -> list[str]:
     titles: list[str] = []
     seen: set[str] = set()
 
@@ -343,16 +373,132 @@ async def get_cinemeta_search_titles(content_type: str, stremio_id: str) -> list
             slug_tail = slug_tail.rsplit('-', 1)[0]
         add(slug_tail.replace('-', ' '))
 
-    await _save_cached_cinemeta_titles(content_type, stremio_id, titles)
-
-    enriched_titles = await _get_anilist_search_titles(content_type, titles)
-    for value in enriched_titles:
-        add(value)
-
     return titles
 
 
-async def _get_anilist_search_titles(content_type: str, seed_titles: list[str]) -> list[str]:
+async def _get_cinemeta_target_year(
+    content_type: str,
+    stremio_id: str,
+    season_number: int | None,
+    episode_number: int,
+) -> int | None:
+    if content_type == 'movie' or season_number is None:
+        return None
+
+    meta = await _fetch_cinemeta_meta(content_type, stremio_id)
+    if meta is None:
+        return None
+    return _extract_cinemeta_target_year(meta, season_number, episode_number)
+
+
+def _extract_cinemeta_target_year(meta: dict, season_number: int | None, episode_number: int) -> int | None:
+    if season_number is None:
+        return None
+
+    videos = meta.get('videos')
+    if not isinstance(videos, list):
+        return None
+
+    fallback_year: int | None = None
+    for item in videos:
+        if not isinstance(item, dict):
+            continue
+
+        item_season = item.get('season')
+        item_episode = item.get('number', item.get('episode'))
+        if item_season != season_number:
+            continue
+
+        item_year = _extract_year_from_cinemeta_video(item)
+        if fallback_year is None:
+            fallback_year = item_year
+
+        if item_episode == episode_number:
+            return item_year
+
+    return fallback_year
+
+
+def _extract_year_from_cinemeta_video(video: dict) -> int | None:
+    for key in ('firstAired', 'released'):
+        value = video.get(key)
+        if not isinstance(value, str) or len(value) < 4:
+            continue
+        year_text = value[:4]
+        if year_text.isdigit():
+            return int(year_text)
+    return None
+
+
+def _merge_search_titles(base_titles: list[str], enriched_titles: list[str], season_number: int | None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    ordered_enriched = list(enriched_titles)
+    if season_number is not None:
+        ordered_enriched = _prioritize_titles_for_requested_season(base_titles, ordered_enriched, season_number)
+        for value in ordered_enriched + base_titles:
+            _append_unique_title(merged, seen, value)
+        return merged
+
+    for value in base_titles + ordered_enriched:
+        _append_unique_title(merged, seen, value)
+    return merged
+
+
+def _prioritize_titles_for_requested_season(
+    base_titles: list[str],
+    enriched_titles: list[str],
+    season_number: int,
+) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in enriched_titles:
+        _append_unique_title(deduped, seen, value)
+
+    if season_number <= 0:
+        return deduped
+
+    normalized_roots = {
+        _normalize_search_text(value)
+        for value in base_titles
+        if isinstance(value, str) and value.strip()
+    }
+    season_variants = [value for value in deduped if _looks_like_season_variant(value, normalized_roots)]
+    if not season_variants or season_number > len(season_variants):
+        return deduped
+
+    preferred = season_variants[season_number - 1]
+    return [preferred] + [value for value in deduped if value != preferred]
+
+
+def _looks_like_season_variant(title: str, normalized_roots: set[str]) -> bool:
+    normalized_title = _normalize_search_text(title)
+    generic_suffixes = {
+        'series',
+        'the series',
+        'serial',
+        'serie',
+        'serien',
+    }
+
+    for root in normalized_roots:
+        if not root or normalized_title == root or not normalized_title.startswith(root):
+            continue
+
+        suffix = normalized_title[len(root):].strip(' :-')
+        if not suffix or suffix in generic_suffixes:
+            return False
+        return True
+
+    return False
+
+
+async def _get_anilist_search_titles(
+    content_type: str,
+    seed_titles: list[str],
+    target_year: int | None = None,
+) -> list[str]:
     if not seed_titles:
         return []
 
@@ -361,11 +507,12 @@ async def _get_anilist_search_titles(content_type: str, seed_titles: list[str]) 
 
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for seed_title in seed_titles[:4]:
-            cached_titles = await _get_cached_anilist_titles(content_type, seed_title)
-            if cached_titles is not None:
-                for value in cached_titles:
-                    _append_unique_title(titles, seen, value)
-                continue
+            if target_year is None:
+                cached_titles = await _get_cached_anilist_titles(content_type, seed_title)
+                if cached_titles is not None:
+                    for value in cached_titles:
+                        _append_unique_title(titles, seen, value)
+                    continue
 
             response = await client.post(
                 'https://graphql.anilist.co',
@@ -376,7 +523,7 @@ async def _get_anilist_search_titles(content_type: str, seed_titles: list[str]) 
                 continue
 
             media_items = response.json().get('data', {}).get('Page', {}).get('media', [])
-            best_match = _select_best_anilist_match(seed_title, media_items, content_type)
+            best_match = _select_best_anilist_match(seed_title, media_items, content_type, target_year=target_year)
             if best_match is None:
                 continue
 
@@ -398,7 +545,8 @@ async def _get_anilist_search_titles(content_type: str, seed_titles: list[str]) 
                         cached_payload.append(value)
                     _append_unique_title(titles, seen, value)
 
-            await _save_cached_anilist_titles(content_type, seed_title, cached_payload)
+            if target_year is None:
+                await _save_cached_anilist_titles(content_type, seed_title, cached_payload)
 
     return titles
 
@@ -511,14 +659,24 @@ async def _save_cached_anilist_titles(content_type: str, seed_title: str, titles
         await session.commit()
 
 
-def _select_best_anilist_match(seed_title: str, media_items: list[dict], content_type: str) -> dict | None:
+def _select_best_anilist_match(
+    seed_title: str,
+    media_items: list[dict],
+    content_type: str,
+    target_year: int | None = None,
+) -> dict | None:
     if not media_items:
         return None
 
-    return max(media_items, key=lambda item: _score_anilist_match(seed_title, item, content_type))
+    return max(media_items, key=lambda item: _score_anilist_match(seed_title, item, content_type, target_year=target_year))
 
 
-def _score_anilist_match(seed_title: str, media_item: dict, content_type: str) -> int:
+def _score_anilist_match(
+    seed_title: str,
+    media_item: dict,
+    content_type: str,
+    target_year: int | None = None,
+) -> int:
     score = 0
     normalized_seed = _normalize_search_text(seed_title)
     candidates = _extract_anilist_titles(media_item)
@@ -551,7 +709,37 @@ def _score_anilist_match(seed_title: str, media_item: dict, content_type: str) -
     if english_title and _normalize_search_text(english_title) == normalized_seed:
         score += 25
 
+    if target_year is not None:
+        media_year = _extract_anilist_year(media_item)
+        if media_year is None:
+            score -= 10
+        else:
+            year_delta = abs(media_year - target_year)
+            if year_delta == 0:
+                score += 140
+            elif year_delta == 1:
+                score += 95
+            elif year_delta <= 3:
+                score += 55
+            elif year_delta <= 6:
+                score += 20
+            else:
+                score -= min(year_delta * 5, 80)
+
     return score
+
+
+def _extract_anilist_year(media_item: dict) -> int | None:
+    season_year = media_item.get('seasonYear')
+    if isinstance(season_year, int) and season_year > 0:
+        return season_year
+
+    start_date = media_item.get('startDate') or {}
+    start_year = start_date.get('year') if isinstance(start_date, dict) else None
+    if isinstance(start_year, int) and start_year > 0:
+        return start_year
+
+    return None
 
 
 def _extract_anilist_titles(media_item: dict) -> list[str]:
