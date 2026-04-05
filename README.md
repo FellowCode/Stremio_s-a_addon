@@ -6,6 +6,7 @@ FastAPI addon for Stremio that resolves anime streams through SmotretAnime and r
 
 - Exposes Stremio addon manifests and `stream` endpoints.
 - Resolves Stremio ids into search targets using Kitsu, AniList, and Cinemeta.
+- Enriches Kitsu search targets with MyAnimeList and AniList aliases when mappings are available.
 - Searches SmotretAnime by external ids first when possible, then falls back to title search.
 - Supports multiple quality profiles such as `hd`, `fhd`, and `4k`.
 - Caches episode, translation, video, title, release-status, and Kitsu mapping data in SQLite via SQLAlchemy.
@@ -72,6 +73,8 @@ Important settings in [settings.py](/c:/Users/Admin/Documents/GitHub/stremio_s-a
 - `FLARESOLVERR_HOST`
 - `FLARESOLVERR_PORT`
 - `FLARESOLVERR_SESSION_POOL_SIZE`
+- `FLARESOLVERR_PERSIST_SESSIONS`
+- `FLARESOLVERR_SESSION_STATE_FILE`
 - `QUALITY_PROFILES`
 - cache TTL values for episodes, translations, videos, AniList, Cinemeta, and Kitsu mappings
 
@@ -145,6 +148,7 @@ Notes:
 `flaresolverr`:
 
 - uses a session pool
+- persists session ids to reuse authenticated FlareSolverr browser sessions across addon restarts when `FLARESOLVERR_PERSIST_SESSIONS` is enabled
 - automatically reauthenticates if parsing hits the login page again
 - concurrent upstream work is limited by `FLARESOLVERR_SESSION_POOL_SIZE`
 

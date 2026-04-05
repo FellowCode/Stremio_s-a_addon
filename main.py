@@ -1,6 +1,7 @@
-import asyncio
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
+import sys
 
 
 
@@ -16,6 +17,32 @@ from settings import QUALITY_PROFILES
 
 
 FAVICON_PATH = Path(__file__).resolve().parent / 'static' / 'favicon.ico'
+_LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+
+
+def configure_logging() -> None:
+    """Force root logger to INFO / stdout regardless of prior configuration."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    root.addHandler(handler)
+
+    for existing in root.manager.loggerDict.values():
+        if isinstance(existing, logging.Logger):
+            existing.disabled = False
+
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    logging.getLogger('uvicorn.access').setLevel(logging.INFO)
+
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 class PrivateNetworkCORSMiddleware(CORSMiddleware):
@@ -48,14 +75,40 @@ def build_manifest(base_url: str, quality_profile: str) -> dict:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    run_migrations()
-    await SmotretAnimeParser.init()
-    print('Application startup complete. Parser initialized. Addon is ready on http://127.0.0.1:8000')
+    try:
+        run_migrations()
+        configure_logging()
+        await SmotretAnimeParser.init()
+    except Exception:
+        logger.exception('Application startup failed during lifespan initialization')
+        raise
+
+    logger.info('Application startup complete. Parser initialized. Addon is ready on http://127.0.0.1:8000')
+    lifespan_failed = False
     try:
         yield
+    except Exception:
+        lifespan_failed = True
+        logger.exception('Application lifespan failed while serving requests')
+        raise
     finally:
-        await SmotretAnimeParser.close()
-        await close_engine()
+        shutdown_error: Exception | None = None
+
+        try:
+            await SmotretAnimeParser.close()
+        except Exception as exc:
+            shutdown_error = exc
+            logger.exception('Application shutdown failed while closing parser')
+
+        try:
+            await close_engine()
+        except Exception as exc:
+            if shutdown_error is None:
+                shutdown_error = exc
+            logger.exception('Application shutdown failed while closing database engine')
+
+        if shutdown_error is not None and not lifespan_failed:
+            raise shutdown_error
 
 
 app = FastAPI(lifespan=lifespan)
@@ -163,4 +216,4 @@ async def login_sa():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)

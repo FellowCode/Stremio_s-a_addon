@@ -47,6 +47,11 @@ When changing these areas, verify both:
 - deduplicated requests still coalesce to one upstream operation
 - cancellation of one waiter does not break the other waiter
 
+Also preserve:
+
+- FlareSolverr session pool reuse across addon restarts when persistence is enabled
+- stable queue behavior so each request returns its borrowed FlareSolverr session to the pool
+
 ## Authentication Rules
 
 1. SmotretAnime auth may expire during runtime.
@@ -54,6 +59,9 @@ When changing these areas, verify both:
 3. In `flaresolverr` mode, auth is session-specific.
 4. In `scrapedo` mode, cookies are persisted in `cookies.txt`.
 5. Startup should authenticate before serving requests.
+6. In `flaresolverr` mode, addon-level persistence reuses FlareSolverr `session` ids from `FLARESOLVERR_SESSION_STATE_FILE` when `FLARESOLVERR_PERSIST_SESSIONS` is enabled.
+7. FlareSolverr auth persistence depends on the FlareSolverr service keeping those sessions alive; addon restart reuse is supported, FlareSolverr container restart still requires reauthentication.
+8. Do not silently destroy persisted FlareSolverr sessions on addon shutdown unless the change explicitly disables persistence or is a manual reset flow.
 
 ## Cache Rules
 
@@ -67,6 +75,9 @@ When changing these areas, verify both:
 1. Do not silently swallow parser failures.
 2. Use contextual logs with enough fields to identify provider, title, episode, quality profile, or URL.
 3. Preserve existing behavior for users where possible, but make failures observable in logs.
+4. Keep startup/auth logs informative but not noisy: suppress routine `httpx` request logs, keep SA auth/session lifecycle logs.
+5. If changing startup or migrations, preserve the current guarantee that lifespan failures are visible in stdout.
+6. Alembic logging config must not disable application loggers; preserve `disable_existing_loggers=False` in [alembic/env.py](/c:/Users/Admin/Documents/GitHub/stremio_s-a_addon/alembic/env.py).
 
 ## Safe Change Patterns
 
@@ -76,6 +87,7 @@ Preferred patterns:
 - extend `SmotretAnimeParser` for parsing/caching behavior
 - update `settings.py` for non-secret runtime configuration
 - add Alembic migrations for schema changes
+- persist transport state with small local files only when the state belongs to the transport layer and does not need relational queries
 
 Avoid:
 
@@ -83,6 +95,8 @@ Avoid:
 - bypassing the cache layer for one-off fixes
 - adding broad `except Exception: pass` blocks
 - changing public route shapes in [main.py](/c:/Users/Admin/Documents/GitHub/stremio_s-a_addon/main.py) without clear need
+- reintroducing noisy `httpx` INFO logs into normal startup output
+- moving FlareSolverr session persistence into unrelated layers like route handlers or parser cache tables
 
 ## Validation Checklist For Agents
 
@@ -92,6 +106,8 @@ After changing parsing, transport, or cache behavior, validate at least these:
 2. one known stream id still returns non-empty streams
 3. concurrent identical requests still work
 4. if relevant, `flaresolverr` startup/login still works
+5. if relevant, addon restart reuses persisted FlareSolverr sessions or cleanly reauthenticates when persisted sessions are stale
+6. if relevant, startup failures still print actionable logs to stdout
 
 Useful checks include ids like:
 
@@ -117,6 +133,7 @@ Run the server:
 - secrets come from `.env`
 - non-secret configuration is in [settings.py](/c:/Users/Admin/Documents/GitHub/stremio_s-a_addon/settings.py)
 - startup runs Alembic migrations automatically
+- when `FLARESOLVERR_PERSIST_SESSIONS` is enabled, addon state may include `flaresolverr_sessions.json`
 
 ## Documentation Discipline
 

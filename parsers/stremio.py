@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import re
 
 import httpx
@@ -13,6 +14,9 @@ from db.models import AniListTitleCache, CinemetaTitleCache, KitsuMappingsCache
 from db.session import get_session
 from parsers.kitsu import get_anime, get_anime_search_titles
 from settings import ANILIST_CACHE_TTL_HOURS, CINEMETA_CACHE_TTL_HOURS, KITSU_MAPPINGS_CACHE_TTL_HOURS
+
+
+logger = logging.getLogger(__name__)
 
 
 ANILIST_SEARCH_QUERY = '''
@@ -40,6 +44,34 @@ CINEMETA_CACHE_TTL = timedelta(hours=CINEMETA_CACHE_TTL_HOURS)
 KITSU_MAPPINGS_CACHE_TTL = timedelta(hours=KITSU_MAPPINGS_CACHE_TTL_HOURS)
 SEARCH_TARGETS_CACHE_TTL = timedelta(hours=12)
 _SEARCH_TARGETS_CACHE: dict[tuple[str, str, str, int | None, int], tuple[datetime, SearchTargets]] = {}
+
+
+ANILIST_MEDIA_BY_ID_QUERY = '''
+query ($id: Int!) {
+    Media(id: $id, type: ANIME) {
+        idMal
+        title {
+            romaji
+            english
+            native
+        }
+        synonyms
+    }
+}
+'''
+
+ANILIST_MEDIA_BY_MAL_ID_QUERY = '''
+query ($idMal: Int!) {
+    Media(idMal: $idMal, type: ANIME) {
+        title {
+            english
+            romaji
+            native
+        }
+        synonyms
+    }
+}
+'''
 
 
 @dataclass(slots=True)
@@ -104,12 +136,18 @@ async def get_stream_search_targets(content_type: str, stream_request: StreamReq
     )
     cached_targets = _get_cached_search_targets(cache_key)
     if cached_targets is not None:
-        return cached_targets
+        if stream_request.provider != 'kitsu' or cached_targets.external_urls:
+            return cached_targets
+        _SEARCH_TARGETS_CACHE.pop(cache_key, None)
 
     if stream_request.provider == 'kitsu':
         anime, external_urls = await _get_kitsu_search_data(int(stream_request.catalog_id))
-        titles = get_anime_search_titles(anime)
-        targets = SearchTargets(titles=titles, external_urls=external_urls)
+        base_titles = get_anime_search_titles(anime)
+        enriched_titles = await _get_kitsu_enriched_titles(external_urls)
+        targets = SearchTargets(
+            titles=_merge_search_titles(base_titles, enriched_titles, stream_request.season_number),
+            external_urls=external_urls,
+        )
         _save_cached_search_targets(cache_key, targets)
         return targets
 
@@ -133,21 +171,6 @@ async def get_stream_search_targets(content_type: str, stream_request: StreamReq
         return targets
 
     raise ValueError(f'Unsupported provider: {stream_request.provider}')
-
-
-ANILIST_MEDIA_BY_ID_QUERY = '''
-query ($id: Int!) {
-    Media(id: $id, type: ANIME) {
-        idMal
-        title {
-            romaji
-            english
-            native
-        }
-        synonyms
-    }
-}
-'''
 
 
 async def get_anilist_search_targets(anilist_id: int) -> tuple[list[str], list[str]]:
@@ -184,6 +207,40 @@ async def get_anilist_search_targets(anilist_id: int) -> tuple[list[str], list[s
         _append_external_search_url(external_urls, seen_urls, f'https://myanimelist.net/anime/{mal_id}')
 
     return titles, external_urls
+
+
+async def _get_kitsu_enriched_titles(external_urls: list[str]) -> list[str]:
+    mal_id = _extract_mal_anime_id(external_urls)
+    if mal_id is None:
+        return []
+
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        response = await client.post(
+            'https://graphql.anilist.co',
+            json={'query': ANILIST_MEDIA_BY_MAL_ID_QUERY, 'variables': {'idMal': mal_id}},
+            headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+        )
+
+    if response.status_code != 200:
+        return []
+
+    media = response.json().get('data', {}).get('Media') or {}
+    titles: list[str] = []
+    seen_titles: set[str] = set()
+
+    for value in (
+        (media.get('title') or {}).get('english'),
+        (media.get('title') or {}).get('romaji'),
+        (media.get('title') or {}).get('native'),
+    ):
+        _append_title_variants(titles, seen_titles, value)
+
+    synonyms = media.get('synonyms') or []
+    if isinstance(synonyms, list):
+        for value in synonyms:
+            _append_title_variants(titles, seen_titles, value)
+
+    return titles
 
 
 async def _get_kitsu_search_data(kitsu_id: int):
@@ -235,6 +292,7 @@ async def _get_cached_kitsu_external_search_urls(kitsu_id: int) -> list[str] | N
         try:
             payload = json.loads(cached_entry.external_urls_json)
         except json.JSONDecodeError:
+            logger.warning('Failed to decode cached Kitsu external URLs: kitsu_id=%s', kitsu_id, exc_info=True)
             return None
 
         if not isinstance(payload, list):
@@ -281,6 +339,15 @@ def _build_supported_external_url(external_site: str, external_id: str) -> str |
         return f'https://www.animenewsnetwork.com/encyclopedia/anime.php?id={external_id}'
     if normalized_site in {'fansubs', 'fansubs.ru', 'kage-project', 'kageproject'}:
         return f'https://fansubs.ru/base.php?id={external_id}'
+    return None
+
+
+def _extract_mal_anime_id(external_urls: list[str]) -> int | None:
+    for url in external_urls:
+        match = re.search(r'myanimelist\.net/anime/(\d+)', url, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        return int(match.group(1))
     return None
 
 
@@ -564,6 +631,12 @@ async def _get_cached_cinemeta_titles(content_type: str, stremio_id: str) -> lis
         try:
             payload = json.loads(cached_entry.titles_json)
         except json.JSONDecodeError:
+            logger.warning(
+                'Failed to decode cached Cinemeta titles: content_type=%s stremio_id=%s',
+                content_type,
+                stremio_id,
+                exc_info=True,
+            )
             return None
 
         if not isinstance(payload, list):
@@ -618,6 +691,13 @@ async def _get_cached_anilist_titles(content_type: str, seed_title: str) -> list
         try:
             payload = json.loads(cached_entry.titles_json)
         except json.JSONDecodeError:
+            logger.warning(
+                'Failed to decode cached AniList titles: content_type=%s seed_title=%s cache_key=%s',
+                content_type,
+                seed_title,
+                cache_key,
+                exc_info=True,
+            )
             return None
 
         if not isinstance(payload, list):

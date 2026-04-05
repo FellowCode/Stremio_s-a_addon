@@ -22,6 +22,8 @@ from settings import (
     FLARESOLVERR_HTTP_TIMEOUT_SECONDS,
     FLARESOLVERR_MAX_TIMEOUT_MS,
     FLARESOLVERR_PORT,
+    FLARESOLVERR_PERSIST_SESSIONS,
+    FLARESOLVERR_SESSION_STATE_FILE,
     FLARESOLVERR_SESSION_POOL_SIZE,
     FINISHED_EPISODE_CACHE_TTL_HOURS,
     FINISHED_STABLE_AFTER_DAYS,
@@ -40,6 +42,26 @@ from settings import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _response_text_preview(response: httpx.Response, max_length: int = 600) -> str:
+    body = response.text.strip()
+    if not body:
+        return '<empty>'
+
+    normalized = re.sub(r'\s+', ' ', body)
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[:max_length] + '...'
+
+
+def _raise_for_status_with_context(response: httpx.Response, context: str) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f'{context}: status={response.status_code} url={response.request.url} body={_response_text_preview(response)}'
+        ) from exc
 
 
 class EpisodeSchema(BaseModel):
@@ -91,6 +113,70 @@ class SmotretAnimeProxyClient:
     inflight_lock: asyncio.Lock | None = None
     auth_refresh_lock: asyncio.Lock | None = None
     inflight_requests: dict[ProxyRequestKey, asyncio.Task[ProxyResponse]] = {}
+
+    @classmethod
+    def _should_persist_flaresolverr_sessions(cls) -> bool:
+        return cls._get_proxy_provider() == 'flaresolverr' and FLARESOLVERR_PERSIST_SESSIONS
+
+    @classmethod
+    def _load_persisted_flaresolverr_session_ids(cls) -> list[str]:
+        if not cls._should_persist_flaresolverr_sessions() or not os.path.exists(FLARESOLVERR_SESSION_STATE_FILE):
+            return []
+
+        try:
+            with open(FLARESOLVERR_SESSION_STATE_FILE, 'r', encoding='utf-8') as file_handle:
+                payload = json.load(file_handle)
+        except (OSError, json.JSONDecodeError):
+            logger.warning('Failed to load persisted FlareSolverr sessions from %s', FLARESOLVERR_SESSION_STATE_FILE, exc_info=True)
+            return []
+
+        if not isinstance(payload, dict):
+            return []
+        if payload.get('host') != FLARESOLVERR_HOST or payload.get('port') != FLARESOLVERR_PORT:
+            logger.info('Ignoring persisted FlareSolverr sessions because host or port changed')
+            return []
+
+        session_ids = payload.get('session_ids') or []
+        if not isinstance(session_ids, list):
+            return []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in session_ids:
+            if not isinstance(value, str):
+                continue
+            session_id = value.strip()
+            if not session_id or session_id in seen:
+                continue
+            seen.add(session_id)
+            normalized.append(session_id)
+        return normalized
+
+    @classmethod
+    def _save_persisted_flaresolverr_session_ids(cls, session_ids: Sequence[str]) -> None:
+        if not cls._should_persist_flaresolverr_sessions():
+            return
+
+        payload = {
+            'host': FLARESOLVERR_HOST,
+            'port': FLARESOLVERR_PORT,
+            'session_ids': [session_id for session_id in session_ids if isinstance(session_id, str) and session_id],
+        }
+        try:
+            with open(FLARESOLVERR_SESSION_STATE_FILE, 'w', encoding='utf-8') as file_handle:
+                json.dump(payload, file_handle, ensure_ascii=True, indent=2)
+        except OSError:
+            logger.warning('Failed to persist FlareSolverr sessions to %s', FLARESOLVERR_SESSION_STATE_FILE, exc_info=True)
+
+    @classmethod
+    def _clear_persisted_flaresolverr_session_ids(cls) -> None:
+        if not os.path.exists(FLARESOLVERR_SESSION_STATE_FILE):
+            return
+
+        try:
+            os.remove(FLARESOLVERR_SESSION_STATE_FILE)
+        except OSError:
+            logger.warning('Failed to remove persisted FlareSolverr sessions file %s', FLARESOLVERR_SESSION_STATE_FILE, exc_info=True)
 
     @classmethod
     def _get_proxy_provider(cls) -> str:
@@ -358,7 +444,7 @@ class SmotretAnimeProxyClient:
             payload['headers'] = headers
 
         response = await cls.client.post(cls._get_flaresolverr_url(), json=payload)
-        response.raise_for_status()
+        _raise_for_status_with_context(response, 'FlareSolverr request failed')
 
         body = response.json()
         if body.get('status') != 'ok':
@@ -387,6 +473,7 @@ class SmotretAnimeProxyClient:
 
     @classmethod
     async def _login_flaresolverr_session(cls, session_id: str) -> None:
+        logger.info('Starting SmotretAnime login in FlareSolverr session: session_id=%s', session_id)
         login_page = await cls._flaresolverr_request_with_session(session_id, 'request.get', '/users/login')
         csrf = cls._extract_login_csrf(login_page.text)
         data = {
@@ -405,18 +492,33 @@ class SmotretAnimeProxyClient:
         )
         if login_response.status_code != 200:
             raise RuntimeError(f'FlareSolverr login failed with status {login_response.status_code}')
+        logger.info('SmotretAnime login completed in FlareSolverr session: session_id=%s', session_id)
+
+    @classmethod
+    async def _is_flaresolverr_session_authenticated(cls, session_id: str) -> bool:
+        logger.info('Checking persisted SmotretAnime auth in FlareSolverr session: session_id=%s', session_id)
+        response = await cls._flaresolverr_request_with_session(session_id, 'request.get', '/')
+        authenticated = not cls._response_requires_auth(response, cls._normalize_url('/'))
+        if authenticated:
+            logger.info('Persisted FlareSolverr session is still authenticated: session_id=%s', session_id)
+        else:
+            logger.warning('Persisted FlareSolverr session requires reauthentication: session_id=%s', session_id)
+        return authenticated
 
     @classmethod
     async def _refresh_flaresolverr_session_auth(cls, session_id: str) -> None:
         async with cls._get_auth_refresh_lock():
+            logger.info('Refreshing SmotretAnime auth in FlareSolverr session: session_id=%s', session_id)
             await cls._login_flaresolverr_session(session_id)
 
     @classmethod
     async def _refresh_scrapedo_auth(cls, *, force: bool = False) -> None:
         async with cls._get_auth_refresh_lock():
             if not force and cls.cookies is not None:
+                logger.info('Skipping SmotretAnime scrapedo login because cookies are already loaded')
                 return
 
+            logger.info('Starting SmotretAnime login via scrapedo')
             login_page_response = await cls._perform_scrapedo_request('request.get', cls._normalize_url('/users/login'))
             cookies = login_page_response.headers.get('scrape.do-cookies')
             if not cookies:
@@ -445,35 +547,67 @@ class SmotretAnimeProxyClient:
             cls.cookies = refreshed_cookies
             with open('cookies.txt', 'w') as file_handle:
                 file_handle.write(cls.cookies)
+            logger.info('SmotretAnime login via scrapedo completed and cookies were persisted')
 
     @classmethod
-    async def _create_flaresolverr_session(cls) -> str:
-        response = await cls.client.post(cls._get_flaresolverr_url(), json={'cmd': 'sessions.create'})
-        response.raise_for_status()
+    async def _create_flaresolverr_session(cls, session_id: str | None = None) -> tuple[str, bool]:
+        if session_id:
+            logger.info('Opening persisted FlareSolverr session for SmotretAnime authorization: session_id=%s', session_id)
+        else:
+            logger.info('Creating FlareSolverr session for SmotretAnime authorization')
+
+        payload: dict[str, object] = {'cmd': 'sessions.create'}
+        if session_id:
+            payload['session'] = session_id
+
+        response = await cls.client.post(cls._get_flaresolverr_url(), json=payload)
+        _raise_for_status_with_context(response, 'FlareSolverr session create failed')
 
         body = response.json()
         if body.get('status') != 'ok':
             message = body.get('message') or 'Unknown FlareSolverr error'
             raise RuntimeError(f'FlareSolverr session create failed: {message}')
 
-        session_id = body.get('session')
-        if not isinstance(session_id, str) or not session_id:
+        resolved_session_id = body.get('session')
+        if not isinstance(resolved_session_id, str) or not resolved_session_id:
             raise RuntimeError('FlareSolverr did not return a valid session id')
-        return session_id
+
+        reused_existing = body.get('message') == 'Session already exists.'
+        if reused_existing:
+            logger.info('Reused existing FlareSolverr session for SmotretAnime authorization: session_id=%s', resolved_session_id)
+        else:
+            logger.info('Created FlareSolverr session for SmotretAnime authorization: session_id=%s', resolved_session_id)
+        return resolved_session_id, reused_existing
+
+    @classmethod
+    async def _destroy_specific_flaresolverr_sessions(cls, session_ids: Sequence[str]) -> None:
+        if cls.client is None:
+            return
+
+        for session_id in session_ids:
+            try:
+                await cls.client.post(
+                    cls._get_flaresolverr_url(),
+                    json={'cmd': 'sessions.destroy', 'session': session_id},
+                )
+            except httpx.HTTPError:
+                logger.warning('Failed to destroy FlareSolverr session: session_id=%s', session_id, exc_info=True)
 
     @classmethod
     async def _destroy_flaresolverr_sessions(cls) -> None:
         if cls.client is None or not cls.flaresolverr_session_ids:
             return
+        if cls._should_persist_flaresolverr_sessions():
+            logger.info('Leaving FlareSolverr sessions running for reuse across addon restarts: sessions=%s', len(cls.flaresolverr_session_ids))
+            cls._save_persisted_flaresolverr_session_ids(cls.flaresolverr_session_ids)
+            cls.flaresolverr_session_queue = None
+            return
         try:
-            for session_id in cls.flaresolverr_session_ids:
-                await cls.client.post(
-                    cls._get_flaresolverr_url(),
-                    json={'cmd': 'sessions.destroy', 'session': session_id},
-                )
+            await cls._destroy_specific_flaresolverr_sessions(cls.flaresolverr_session_ids)
         except httpx.HTTPError:
             logger.warning('Failed to destroy one or more FlareSolverr sessions during shutdown', exc_info=True)
         finally:
+            cls._clear_persisted_flaresolverr_session_ids()
             cls.flaresolverr_session_ids = []
             cls.flaresolverr_session_queue = None
 
@@ -484,12 +618,14 @@ class SmotretAnimeProxyClient:
                 return {'success': True}
 
             provider = cls._get_proxy_provider()
+            logger.info('Initializing SmotretAnime proxy client: provider=%s', provider)
             timeout = FLARESOLVERR_HTTP_TIMEOUT_SECONDS if provider == 'flaresolverr' else 15.0
             cls.client = httpx.AsyncClient(timeout=timeout)
 
             if provider == 'scrapedo' and os.path.exists('cookies.txt'):
                 with open('cookies.txt', 'r') as file_handle:
                     cls.cookies = file_handle.read().strip()
+                logger.info('Loaded persisted SmotretAnime scrapedo cookies from cookies.txt')
                 return {'success': True}
 
             if provider == 'scrapedo' and not SCRAPE_TOKEN:
@@ -498,14 +634,36 @@ class SmotretAnimeProxyClient:
             if provider == 'flaresolverr':
                 session_queue = cls._get_flaresolverr_session_queue()
                 cls.flaresolverr_session_ids = []
-                for _ in range(cls._get_flaresolverr_session_pool_size()):
-                    session_id = await cls._create_flaresolverr_session()
-                    await cls._login_flaresolverr_session(session_id)
+                persisted_session_ids = cls._load_persisted_flaresolverr_session_ids()
+                desired_pool_size = cls._get_flaresolverr_session_pool_size()
+                logger.info(
+                    'Preparing FlareSolverr session pool for SmotretAnime: pool_size=%s',
+                    desired_pool_size,
+                )
+                if persisted_session_ids:
+                    logger.info('Found persisted FlareSolverr sessions for reuse: count=%s', len(persisted_session_ids))
+
+                active_session_ids = persisted_session_ids[:desired_pool_size]
+                stale_session_ids = persisted_session_ids[desired_pool_size:]
+                if stale_session_ids:
+                    logger.info('Destroying stale persisted FlareSolverr sessions beyond pool size: count=%s', len(stale_session_ids))
+                    await cls._destroy_specific_flaresolverr_sessions(stale_session_ids)
+
+                while len(active_session_ids) < desired_pool_size:
+                    active_session_ids.append('')
+
+                for persisted_session_id in active_session_ids:
+                    session_id, reused_existing = await cls._create_flaresolverr_session(persisted_session_id or None)
+                    if not reused_existing or not await cls._is_flaresolverr_session_authenticated(session_id):
+                        await cls._login_flaresolverr_session(session_id)
                     cls.flaresolverr_session_ids.append(session_id)
                     session_queue.put_nowait(session_id)
+                cls._save_persisted_flaresolverr_session_ids(cls.flaresolverr_session_ids)
+                logger.info('SmotretAnime proxy client initialized with FlareSolverr sessions=%s', len(cls.flaresolverr_session_ids))
                 return {'success': True}
 
             await cls._refresh_scrapedo_auth(force=True)
+            logger.info('SmotretAnime proxy client initialized with scrapedo authorization')
             return {'success': True}
 
     @classmethod
@@ -677,7 +835,10 @@ query ($search: String!) {
             payload['headers'] = headers
 
         response = await cls.client.post(cls._get_flaresolverr_url(), json=payload)
-        response.raise_for_status()
+        _raise_for_status_with_context(
+            response,
+            f'FlareSolverr request failed: session_id={session_id} command={command} target_url={normalized_url}',
+        )
 
         body = response.json()
         if body.get('status') != 'ok':
@@ -731,7 +892,7 @@ query ($search: String!) {
             cls._get_flaresolverr_url(),
             json={'cmd': 'sessions.create'},
         )
-        response.raise_for_status()
+        _raise_for_status_with_context(response, 'FlareSolverr session create failed')
 
         body = response.json()
         if body.get('status') != 'ok':
@@ -754,7 +915,7 @@ query ($search: String!) {
                     json={'cmd': 'sessions.destroy', 'session': session_id},
                 )
         except httpx.HTTPError:
-            pass
+            logger.warning('Failed to destroy one or more FlareSolverr sessions during shutdown', exc_info=True)
         finally:
             cls.flaresolverr_session_ids = []
             cls.flaresolverr_session_queue = None
@@ -1395,6 +1556,12 @@ query ($search: String!) {
         try:
             sources = json.loads(data_sources)
         except json.JSONDecodeError:
+            logger.warning(
+                'Failed to decode embed video sources JSON: quality_profile=%s data_sources=%s',
+                quality_profile,
+                data_sources[:200],
+                exc_info=True,
+            )
             return []
 
         candidates: list[tuple[int, str]] = []
@@ -1641,6 +1808,7 @@ query ($search: String!) {
         try:
             return datetime(year, month, day, tzinfo=timezone.utc)
         except ValueError:
+            logger.warning('Failed to parse AniList end date: end_date=%s', end_date, exc_info=True)
             return None
 
     @classmethod
