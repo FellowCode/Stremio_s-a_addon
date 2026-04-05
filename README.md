@@ -8,6 +8,7 @@ FastAPI addon for Stremio that resolves anime streams through SmotretAnime and r
 - Resolves Stremio ids into search targets using Kitsu, AniList, and Cinemeta.
 - Enriches Kitsu search targets with MyAnimeList and AniList aliases when mappings are available.
 - Searches SmotretAnime by external ids first when possible, then falls back to title search.
+- For `tt...` ids, skips non-anime Cinemeta entries and returns an empty stream list instead of searching SmotretAnime.
 - Supports multiple quality profiles such as `hd`, `fhd`, and `4k`.
 - Caches episode, translation, video, title, release-status, and Kitsu mapping data in SQLite via SQLAlchemy.
 - Supports two upstream transport modes for SmotretAnime parsing:

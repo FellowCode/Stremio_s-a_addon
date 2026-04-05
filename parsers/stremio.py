@@ -394,15 +394,18 @@ async def get_cinemeta_search_titles(
     season_number: int | None = None,
     episode_number: int = 1,
 ) -> list[str]:
-    cached_titles = await _get_cached_cinemeta_titles(content_type, stremio_id)
-    if cached_titles is not None:
-        target_year = await _get_cinemeta_target_year(content_type, stremio_id, season_number, episode_number)
-        enriched_titles = await _get_anilist_search_titles(content_type, list(cached_titles), target_year=target_year)
-        return _merge_search_titles(list(cached_titles), enriched_titles, season_number)
-
     meta = await _fetch_cinemeta_meta(content_type, stremio_id)
     if meta is None:
         return []
+    if not _is_cinemeta_anime(meta):
+        logger.info('Skipping non-anime tt title: content_type=%s stremio_id=%s', content_type, stremio_id)
+        return []
+
+    cached_titles = await _get_cached_cinemeta_titles(content_type, stremio_id)
+    if cached_titles is not None:
+        target_year = _extract_cinemeta_target_year(meta, season_number, episode_number)
+        enriched_titles = await _get_anilist_search_titles(content_type, list(cached_titles), target_year=target_year)
+        return _merge_search_titles(list(cached_titles), enriched_titles, season_number)
 
     titles = _extract_cinemeta_titles(meta)
     await _save_cached_cinemeta_titles(content_type, stremio_id, titles)
@@ -441,6 +444,22 @@ def _extract_cinemeta_titles(meta: dict) -> list[str]:
         add(slug_tail.replace('-', ' '))
 
     return titles
+
+
+def _is_cinemeta_anime(meta: dict) -> bool:
+    genres = meta.get('genres', meta.get('genre'))
+    normalized_genres = {
+        value.casefold().strip()
+        for value in genres
+        if isinstance(value, str) and value.strip()
+    } if isinstance(genres, list) else set()
+
+    if 'anime' in normalized_genres:
+        return True
+
+    country = meta.get('country')
+    normalized_country = country.casefold().strip() if isinstance(country, str) else ''
+    return 'animation' in normalized_genres and normalized_country in {'japan', 'jp'}
 
 
 async def _get_cinemeta_target_year(
