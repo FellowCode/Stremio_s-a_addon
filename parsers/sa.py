@@ -594,6 +594,13 @@ class SmotretAnimeProxyClient:
                 logger.warning('Failed to destroy FlareSolverr session: session_id=%s', session_id, exc_info=True)
 
     @classmethod
+    async def _prepare_flaresolverr_session(cls, persisted_session_id: str | None) -> str:
+        session_id, reused_existing = await cls._create_flaresolverr_session(persisted_session_id)
+        if not reused_existing or not await cls._is_flaresolverr_session_authenticated(session_id):
+            await cls._login_flaresolverr_session(session_id)
+        return session_id
+
+    @classmethod
     async def _destroy_flaresolverr_sessions(cls) -> None:
         if cls.client is None or not cls.flaresolverr_session_ids:
             return
@@ -652,10 +659,11 @@ class SmotretAnimeProxyClient:
                 while len(active_session_ids) < desired_pool_size:
                     active_session_ids.append('')
 
-                for persisted_session_id in active_session_ids:
-                    session_id, reused_existing = await cls._create_flaresolverr_session(persisted_session_id or None)
-                    if not reused_existing or not await cls._is_flaresolverr_session_authenticated(session_id):
-                        await cls._login_flaresolverr_session(session_id)
+                prepared_session_ids = await asyncio.gather(
+                    *(cls._prepare_flaresolverr_session(persisted_session_id or None) for persisted_session_id in active_session_ids)
+                )
+
+                for session_id in prepared_session_ids:
                     cls.flaresolverr_session_ids.append(session_id)
                     session_queue.put_nowait(session_id)
                 cls._save_persisted_flaresolverr_session_ids(cls.flaresolverr_session_ids)
